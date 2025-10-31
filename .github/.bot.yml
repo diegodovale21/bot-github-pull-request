@@ -1,0 +1,63 @@
+# Configuração do bot de geração automática de descrição de PRs
+# Você pode adaptar as chaves e templates conforme sua necessidade.
+
+templates:
+  default_title: 'Descrição automática: {branch}'
+  sections:
+    - id: problem
+      title: 'Qual o problema / Contexto'
+      required: true
+      placeholder: 'Descreva o problema que este PR resolve...'
+    - id: solution
+      title: 'Solução proposta'
+      required: true
+      placeholder: 'Descreva a solução, principais mudanças e decisões...'
+    - id: tests
+      title: 'Como testar'
+      required: false
+      placeholder: 'Passos para reproduzir / validar'
+  footer: |
+    _Gerado automaticamente — se precisar alterar, edite .github/.bot.yml_
+
+rules:
+  # Incluir lista de arquivos modificados no resumo
+  include_changelist: true
+
+  # Número máximo de linhas para exibir de cada arquivo no changelist
+  max_excerpt_lines: 50
+
+  # Comprimento máximo de cada seção (caracteres)
+  max_section_length: 2000
+
+  # Extensões de arquivo a ignorar (não incluídos no changelist)
+  ignore_extensions:
+    - '.png'
+    - '.jpg'
+    - '.jpeg'
+    - '.gif'
+    - '.svg'
+    - '.ico'
+    - '.woff'
+    - '.woff2'
+    - '.ttf'
+    - '.eot'
+    - '.pdf'
+    - '.zip'
+    - '.tar'
+    - '.gz'
+    - '.bin'
+
+  # Patterns de arquivos a ignorar (glob patterns)
+  ignore_patterns:
+    - '**/*.min.js'
+    - '**/*.min.css'
+    - '**/package-lock.json'
+    - '**/yarn.lock'
+    - '**/node_modules/**'
+
+  # Usar delimitadores para preservar conteúdo do usuário
+  # Se true, o bot só atualiza conteúdo entre <!-- BOT_START --> e <!-- BOT_END -->
+  use_delimiters: true
+
+  # Nome do bot (usado para evitar loops - verificar se o sender é o bot)
+  bot_name: 'github-actions[bot]'

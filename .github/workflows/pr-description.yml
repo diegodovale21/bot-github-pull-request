@@ -1,0 +1,35 @@
+name: 'Gerar / Atualizar descrição do PR'
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize]
+
+jobs:
+  build-pr-body:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run generate PR body script
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_EVENT_PATH: ${{ github.event_path }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_ACTOR: ${{ github.actor }}
+        run: |
+          echo "🚀 Iniciando geração de descrição do PR..."
+          node .github/scripts/generate-pr-body.js
