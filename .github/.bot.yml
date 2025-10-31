@@ -29,16 +29,8 @@ rules:
   # Comprimento máximo de cada seção (caracteres)
   max_section_length: 2000
 
-  # Usar LLM para gerar descrição automática baseada nas mudanças
-  use_llm: true
-
-  # Configuração do LLM (atualmente suporta OpenAI)
-  llm:
-    provider: 'openai' # 'openai' ou 'none' para desabilitar
-    model: 'gpt-4o-mini' # Modelo a usar (gpt-4o-mini, gpt-4o, gpt-3.5-turbo)
-    temperature: 0.7 # Criatividade (0.0 = determinístico, 1.0 = criativo)
-    max_tokens: 1000 # Tamanho máximo da resposta
-    # API key deve ser configurada como secret: OPENAI_API_KEY
+  # Usar geração inteligente baseada em heurísticas (analisa diff e gera descrição automaticamente)
+  use_smart_description: true
 
   # Extensões de arquivo a ignorar (não incluídos no changelist)
   ignore_extensions:

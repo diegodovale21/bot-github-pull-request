@@ -2,6 +2,7 @@
  * Script Node.js que:
  * - lê .github/.bot.yml
  * - consulta as patches reais do PR via API
+ * - analisa mudanças e gera descrição inteligente usando heurísticas
  * - monta o body do PR com template + changelist baseado nas mudanças
  * - usa Octokit para atualizar o PR atual
  * - Proteções: evita loop (checa sender), preserva texto de usuário com delimitadores,
@@ -14,7 +15,6 @@ const fs = require('fs');
 const path = require('path');
 const yaml = require('js-yaml');
 const { Octokit } = require('@octokit/core');
-const OpenAI = require('openai');
 
 const BOT_START_MARKER = '<!-- BOT_START -->';
 const BOT_END_MARKER = '<!-- BOT_END -->';
@@ -265,256 +265,287 @@ function extractPreservedContent(currentBody, useDelimiters) {
 }
 
 /**
- * Prepara o contexto das mudanças para o LLM
+ * Gera descrição inteligente baseada em heurísticas (sem LLM)
  */
-async function prepareChangesContext(octokit, owner, repo, prNumber, config) {
-  try {
-    const { data: files } = await octokit.request(
-      'GET /repos/{owner}/{repo}/pulls/{pull_number}/files',
-      {
-        owner,
-        repo,
-        pull_number: prNumber,
-      }
-    );
-
-    if (!files || files.length === 0) {
-      return 'Nenhum arquivo modificado.';
-    }
-
-    let context = 'Mudanças no Pull Request:\n\n';
-
-    for (const file of files) {
-      if (shouldIgnoreFile(file.filename, config)) {
-        continue;
-      }
-
-      const status = file.status;
-      const statusEmoji =
-        status === 'added'
-          ? '➕'
-          : status === 'removed'
-          ? '➖'
-          : status === 'renamed'
-          ? '🔄'
-          : '✏️';
-
-      context += `${statusEmoji} ${file.filename} (${status})\n`;
-
-      if (file.additions)
-        context += `  +${file.additions} linhas adicionadas\n`;
-      if (file.deletions) context += `  -${file.deletions} linhas removidas\n`;
-
-      // Adiciona um resumo do patch (limitado para não exceder tokens)
-      if (file.patch) {
-        const patchLines = file.patch.split('\n').slice(0, 30); // Limita a 30 linhas
-        context += `\n  Diferenças:\n${patchLines.join('\n')}\n`;
-      }
-
-      context += '\n';
-    }
-
-    return context;
-  } catch (error) {
-    console.error('Erro ao preparar contexto:', error.message);
-    return 'Erro ao analisar mudanças.';
-  }
-}
-
-/**
- * Gera descrição inteligente usando LLM
- */
-async function generateLLMDescription(changesContext, prTitle, config) {
+function generateSmartDescription(files, config) {
   const rules = config.rules || {};
-  const llmConfig = rules.llm || {};
 
-  if (!rules.use_llm || llmConfig.provider !== 'openai') {
+  if (!rules.use_smart_description) {
     return null;
   }
 
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) {
-    console.warn('⚠️ OPENAI_API_KEY não configurada. Pulando geração com LLM.');
-    return null;
-  }
+  console.log('🧠 Gerando descrição inteligente usando heurísticas...');
 
   try {
-    const openai = new OpenAI({ apiKey });
+    // Analisa os arquivos modificados
+    const analysis = analyzeChanges(files, config);
+
     const sections = (config.templates && config.templates.sections) || [];
+    const result = {};
 
-    // Prepara prompt com as seções do template
-    const sectionInstructions = sections
-      .map((s) => {
-        const sectionName = s.title.toLowerCase();
-        if (
-          sectionName.includes('problema') ||
-          sectionName.includes('contexto')
-        ) {
-          return `- **${s.title}**: Analise as mudanças e identifique qual problema ou contexto motivou essas alterações.`;
-        } else if (
-          sectionName.includes('solução') ||
-          sectionName.includes('proposta')
-        ) {
-          return `- **${s.title}**: Descreva a solução implementada, principais mudanças técnicas e decisões arquiteturais.`;
-        } else if (
-          sectionName.includes('testar') ||
-          sectionName.includes('teste')
-        ) {
-          return `- **${s.title}**: Sugira passos para testar e validar as mudanças.`;
-        }
-        return `- **${s.title}**: ${s.placeholder || ''}`;
-      })
-      .join('\n');
+    for (const section of sections) {
+      const sectionName = section.title.toLowerCase();
 
-    const sectionTitles = sections.map((s) => s.title).join(', ');
+      if (
+        sectionName.includes('problema') ||
+        sectionName.includes('contexto')
+      ) {
+        result[section.title.toLowerCase()] = generateProblemContext(analysis);
+      } else if (
+        sectionName.includes('solução') ||
+        sectionName.includes('proposta')
+      ) {
+        result[section.title.toLowerCase()] = generateSolution(analysis);
+      } else if (
+        sectionName.includes('testar') ||
+        sectionName.includes('teste')
+      ) {
+        result[section.title.toLowerCase()] = generateTestingSteps(analysis);
+      }
+    }
 
-    const prompt = `Você é um assistente especializado em analisar Pull Requests. Analise as seguintes mudanças e gere uma descrição estruturada do PR.
-
-**Mudanças:**
-${changesContext}
-
-**Instruções:**
-Gere uma descrição profissional em português brasileiro, preenchendo as seguintes seções nesta ordem exata:
-${sectionInstructions}
-
-**Formato de resposta obrigatório:**
-Para cada seção, use exatamente este formato:
-**Nome da Seção:**
-Conteúdo da seção aqui...
-
-Exemplo:
-**Qual o problema / Contexto:**
-Este PR resolve o problema de...
-
-**Solução proposta:**
-A solução implementa...
-
-IMPORTANTE: Use o formato **Título da Seção:** seguido de quebra de linha e o conteúdo. Use exatamente os títulos: ${sectionTitles}
-
-**Requisitos:**
-- Seja específico e técnico
-- Mencione arquivos e funcionalidades alteradas quando relevante
-- Use linguagem clara e objetiva
-- Respeite o formato exato acima
-- Preencha TODAS as seções solicitadas`;
-
-    const response = await openai.chat.completions.create({
-      model: llmConfig.model || 'gpt-4o-mini',
-      messages: [
-        {
-          role: 'system',
-          content:
-            'Você é um assistente especializado em documentar Pull Requests de forma técnica e profissional.',
-        },
-        {
-          role: 'user',
-          content: prompt,
-        },
-      ],
-      temperature: llmConfig.temperature || 0.7,
-      max_tokens: llmConfig.max_tokens || 1000,
-    });
-
-    const generatedContent = response.choices[0]?.message?.content || '';
-    return generatedContent.trim();
+    return result;
   } catch (error) {
-    console.error('Erro ao gerar descrição com LLM:', error.message);
+    console.error('Erro ao gerar descrição inteligente:', error.message);
     return null;
   }
 }
 
 /**
- * Parseia a resposta do LLM e preenche as seções
+ * Analisa as mudanças e extrai informações úteis
  */
-function parseLLMResponse(llmResponse, sections) {
-  const parsed = {};
-  const lines = llmResponse.split('\n');
-  let currentSection = null;
-  let currentContent = [];
+function analyzeChanges(files, config) {
+  const analysis = {
+    fileTypes: {},
+    categories: [],
+    totalAdditions: 0,
+    totalDeletions: 0,
+    newFiles: [],
+    modifiedFiles: [],
+    removedFiles: [],
+    configFiles: [],
+    testFiles: [],
+    frontendFiles: [],
+    backendFiles: [],
+    docsFiles: [],
+  };
 
-  // Mapeia títulos das seções para identificação
-  const sectionMap = {};
-  for (const s of sections) {
-    const key = s.title.toLowerCase();
-    sectionMap[key] = s.title;
-    // Também adiciona variações comuns
-    if (key.includes('problema')) sectionMap['problema'] = s.title;
-    if (key.includes('contexto')) sectionMap['contexto'] = s.title;
-    if (key.includes('solução')) sectionMap['solução'] = s.title;
-    if (key.includes('proposta')) sectionMap['proposta'] = s.title;
-    if (key.includes('testar')) sectionMap['testar'] = s.title;
-    if (key.includes('teste')) sectionMap['teste'] = s.title;
-  }
-
-  for (const line of lines) {
-    // Detecta início de seção em vários formatos
-    let sectionTitle = null;
-
-    // Formato: ## Título
-    let match = line.match(/^##\s*(.+)$/);
-    if (match) {
-      sectionTitle = match[1].trim().toLowerCase();
-    }
-
-    // Formato: **Título** ou *Título*
-    if (!sectionTitle) {
-      match = line.match(/^\*\*?\s*(.+?)\s*\*?\*?$/);
-      if (match && line.includes('**')) {
-        sectionTitle = match[1].trim().toLowerCase();
-      }
-    }
-
-    // Formato: Título: (sem markdown)
-    if (!sectionTitle) {
-      match = line.match(/^(.+?):\s*$/);
-      if (match && match[1].length < 50) {
-        sectionTitle = match[1].trim().toLowerCase();
-      }
-    }
-
-    if (sectionTitle) {
-      // Salva seção anterior
-      if (currentSection && currentContent.length > 0) {
-        parsed[currentSection] = currentContent.join('\n').trim();
-      }
-
-      // Mapeia para a seção correta
-      for (const key in sectionMap) {
-        if (sectionTitle.includes(key) || key.includes(sectionTitle)) {
-          currentSection = sectionMap[key].toLowerCase();
-          currentContent = [];
-          break;
-        }
-      }
-
-      // Se não encontrou mapeamento, tenta usar diretamente
-      if (!currentSection && sectionMap[sectionTitle]) {
-        currentSection = sectionMap[sectionTitle].toLowerCase();
-        currentContent = [];
-      }
-
+  for (const file of files) {
+    if (shouldIgnoreFile(file.filename, config)) {
       continue;
     }
 
-    // Adiciona conteúdo à seção atual
-    if (currentSection && line.trim()) {
-      currentContent.push(line);
-    } else if (!currentSection && line.trim() && !line.match(/^[-*]\s*$/)) {
-      // Se não há seção definida mas há conteúdo, pode ser que o LLM não formatou
-      // Tenta associar ao primeiro conteúdo encontrado
-      if (sections.length > 0 && !parsed[sections[0].title.toLowerCase()]) {
-        currentSection = sections[0].title.toLowerCase();
-        currentContent = [line];
-      }
+    const ext = path.extname(file.filename).toLowerCase();
+    const filename = path.basename(file.filename).toLowerCase();
+    const dir = path.dirname(file.filename).toLowerCase();
+
+    analysis.totalAdditions += file.additions || 0;
+    analysis.totalDeletions += file.deletions || 0;
+
+    // Categoriza por tipo de arquivo
+    if (ext === '.js' || ext === '.ts' || ext === '.jsx' || ext === '.tsx') {
+      analysis.fileTypes[ext] = (analysis.fileTypes[ext] || 0) + 1;
+    }
+
+    // Categoriza por status
+    if (file.status === 'added') {
+      analysis.newFiles.push(file.filename);
+    } else if (file.status === 'removed') {
+      analysis.removedFiles.push(file.filename);
+    } else {
+      analysis.modifiedFiles.push(file.filename);
+    }
+
+    // Categoriza por tipo de mudança
+    if (
+      filename.includes('test') ||
+      filename.includes('spec') ||
+      dir.includes('test')
+    ) {
+      analysis.testFiles.push(file.filename);
+      analysis.categories.push('testes');
+    }
+
+    if (
+      filename.includes('config') ||
+      filename.includes('conf') ||
+      ext === '.yml' ||
+      ext === '.yaml' ||
+      filename === 'package.json' ||
+      filename === 'package-lock.json'
+    ) {
+      analysis.configFiles.push(file.filename);
+      analysis.categories.push('configuração');
+    }
+
+    if (
+      ext === '.html' ||
+      ext === '.css' ||
+      ext === '.scss' ||
+      ext === '.vue' ||
+      dir.includes('frontend') ||
+      dir.includes('client') ||
+      dir.includes('ui')
+    ) {
+      analysis.frontendFiles.push(file.filename);
+      analysis.categories.push('frontend');
+    }
+
+    if (
+      ext === '.py' ||
+      ext === '.java' ||
+      ext === '.go' ||
+      ext === '.rb' ||
+      dir.includes('backend') ||
+      dir.includes('server') ||
+      dir.includes('api')
+    ) {
+      analysis.backendFiles.push(file.filename);
+      analysis.categories.push('backend');
+    }
+
+    if (
+      ext === '.md' ||
+      filename.includes('readme') ||
+      filename.includes('docs')
+    ) {
+      analysis.docsFiles.push(file.filename);
+      analysis.categories.push('documentação');
     }
   }
 
-  // Adiciona último conteúdo
-  if (currentSection && currentContent.length > 0) {
-    parsed[currentSection] = currentContent.join('\n').trim();
+  return analysis;
+}
+
+/**
+ * Gera descrição do problema/contexto baseado na análise
+ */
+function generateProblemContext(analysis) {
+  const parts = [];
+
+  if (analysis.removedFiles.length > 0) {
+    parts.push(
+      `Remove ${analysis.removedFiles.length} arquivo(s) obsoleto(s).`
+    );
   }
 
-  return parsed;
+  if (analysis.testFiles.length > 0) {
+    parts.push(`Adiciona/melhor a cobertura de testes.`);
+  }
+
+  if (analysis.configFiles.length > 0) {
+    parts.push(`Atualiza configurações do projeto.`);
+  }
+
+  if (analysis.frontendFiles.length > 0 && analysis.backendFiles.length === 0) {
+    parts.push(`Implementa melhorias na interface do usuário.`);
+  }
+
+  if (analysis.backendFiles.length > 0 && analysis.frontendFiles.length === 0) {
+    parts.push(`Implementa melhorias na lógica de negócio/API.`);
+  }
+
+  if (analysis.newFiles.length > 0 && analysis.modifiedFiles.length === 0) {
+    parts.push(`Adiciona nova funcionalidade.`);
+  }
+
+  if (analysis.totalDeletions > analysis.totalAdditions * 1.5) {
+    parts.push(`Refatora código removendo código obsoleto ou duplicado.`);
+  }
+
+  if (parts.length === 0) {
+    parts.push(
+      `Implementa mudanças no código baseado nos arquivos modificados.`
+    );
+  }
+
+  return parts.join(' ') || 'Este PR implementa mudanças no código.';
+}
+
+/**
+ * Gera descrição da solução baseado na análise
+ */
+function generateSolution(analysis) {
+  const parts = [];
+
+  if (analysis.newFiles.length > 0) {
+    const newFilesList = analysis.newFiles
+      .slice(0, 3)
+      .map((f) => `\`${f}\``)
+      .join(', ');
+    parts.push(
+      `**Arquivos adicionados:** ${newFilesList}${
+        analysis.newFiles.length > 3 ? '...' : ''
+      }`
+    );
+  }
+
+  if (analysis.modifiedFiles.length > 0) {
+    const modifiedList = analysis.modifiedFiles
+      .slice(0, 3)
+      .map((f) => `\`${f}\``)
+      .join(', ');
+    parts.push(
+      `**Arquivos modificados:** ${modifiedList}${
+        analysis.modifiedFiles.length > 3 ? '...' : ''
+      }`
+    );
+  }
+
+  const stats = [];
+  if (analysis.totalAdditions > 0) {
+    stats.push(`+${analysis.totalAdditions} linhas`);
+  }
+  if (analysis.totalDeletions > 0) {
+    stats.push(`-${analysis.totalDeletions} linhas`);
+  }
+  if (stats.length > 0) {
+    parts.push(`**Estatísticas:** ${stats.join(', ')}`);
+  }
+
+  if (analysis.categories.length > 0) {
+    const uniqueCategories = [...new Set(analysis.categories)];
+    parts.push(`**Categorias:** ${uniqueCategories.join(', ')}`);
+  }
+
+  if (parts.length === 0) {
+    parts.push('Modificações nos arquivos do projeto.');
+  }
+
+  return parts.join('\n\n');
+}
+
+/**
+ * Gera passos de teste baseado na análise
+ */
+function generateTestingSteps(analysis) {
+  const steps = [];
+
+  if (analysis.frontendFiles.length > 0) {
+    steps.push('1. Testar a interface em diferentes navegadores');
+    steps.push('2. Verificar responsividade em dispositivos móveis');
+  }
+
+  if (analysis.backendFiles.length > 0) {
+    steps.push('1. Executar testes unitários');
+    steps.push('2. Testar endpoints da API');
+  }
+
+  if (analysis.testFiles.length > 0) {
+    steps.push('1. Executar suite de testes');
+    steps.push('2. Verificar cobertura de testes');
+  }
+
+  if (analysis.configFiles.length > 0) {
+    steps.push('1. Verificar se as configurações foram aplicadas corretamente');
+  }
+
+  if (steps.length === 0) {
+    steps.push('1. Verificar se as mudanças funcionam como esperado');
+    steps.push('2. Testar os cenários principais');
+  }
+
+  return steps.join('\n');
 }
 
 /**
@@ -529,57 +560,64 @@ async function buildBody(config, event, octokit, owner, repo, prNumber) {
   const sections = (config.templates && config.templates.sections) || [];
   let body = `# ${title}\n\n`;
 
-  // Tenta gerar descrição com LLM se habilitado
-  let llmContent = null;
-  const rules = config.rules || {};
-  if (rules.use_llm) {
-    try {
-      const changesContext = await prepareChangesContext(
-        octokit,
+  // Busca arquivos do PR para análise
+  let files = [];
+  try {
+    const { data: prFiles } = await octokit.request(
+      'GET /repos/{owner}/{repo}/pulls/{pull_number}/files',
+      {
         owner,
         repo,
-        prNumber,
-        config
-      );
-      llmContent = await generateLLMDescription(changesContext, title, config);
-
-      if (llmContent) {
-        const parsedSections = parseLLMResponse(llmContent, sections);
-
-        // Preenche seções com conteúdo do LLM ou placeholder
-        for (const s of sections) {
-          body += `## ${s.title}\n\n`;
-          const sectionKey = s.title.toLowerCase();
-          const llmText = parsedSections[sectionKey];
-
-          if (llmText) {
-            body += `${llmText}\n\n`;
-          } else {
-            // Fallback: busca no conteúdo completo
-            const sectionLower = s.title.toLowerCase();
-            let found = false;
-            for (const key in parsedSections) {
-              if (sectionLower.includes(key) || key.includes(sectionLower)) {
-                body += `${parsedSections[key]}\n\n`;
-                found = true;
-                break;
-              }
-            }
-            if (!found) {
-              body += `${s.placeholder || ''}\n\n`;
-            }
-          }
-        }
+        pull_number: prNumber,
       }
-    } catch (error) {
-      console.error('Erro ao usar LLM, usando template padrão:', error.message);
+    );
+    files = prFiles || [];
+  } catch (error) {
+    console.warn('⚠️  Não foi possível buscar arquivos do PR:', error.message);
+  }
+
+  // Tenta gerar descrição inteligente (sem LLM) primeiro
+  let smartDescription = null;
+  const rules = config.rules || {};
+
+  if (rules.use_smart_description && files.length > 0) {
+    smartDescription = generateSmartDescription(files, config);
+    if (smartDescription) {
+      console.log('✅ Descrição inteligente gerada usando heurísticas');
     }
   }
 
-  // Se LLM não foi usado ou falhou, usa template padrão
-  if (!llmContent) {
-    for (const s of sections) {
-      body += `## ${s.title}\n\n`;
+  // Preenche seções com descrição gerada ou placeholder
+  for (const s of sections) {
+    body += `## ${s.title}\n\n`;
+
+    let sectionContent = null;
+    if (smartDescription) {
+      const sectionKey = s.title.toLowerCase();
+      sectionContent = smartDescription[sectionKey];
+
+      // Busca flexível se não encontrou pela chave exata
+      if (!sectionContent && typeof smartDescription === 'object') {
+        const sectionLower = s.title.toLowerCase();
+        const keywords = sectionLower.split(/[\s\/]+/);
+        for (const key in smartDescription) {
+          const keyLower = key.toLowerCase();
+          if (
+            keywords.some(
+              (kw) => keyLower.includes(kw) || kw.includes(keyLower)
+            )
+          ) {
+            sectionContent = smartDescription[key];
+            break;
+          }
+        }
+      }
+    }
+
+    if (sectionContent && sectionContent.length > 10) {
+      body += `${sectionContent}\n\n`;
+    } else {
+      // Fallback: usa placeholder
       body += `${s.placeholder || ''}\n\n`;
     }
   }
@@ -738,16 +776,38 @@ async function main() {
     const octokit = new Octokit({ auth: process.env.GITHUB_TOKEN });
 
     // Busca o PR atual para obter o body existente
-    const { data: currentPR } = await octokit.request(
-      'GET /repos/{owner}/{repo}/pulls/{pull_number}',
-      {
-        owner,
-        repo: repoName,
-        pull_number: prNumber,
+    let currentBody = '';
+    try {
+      const { data: currentPR } = await octokit.request(
+        'GET /repos/{owner}/{repo}/pulls/{pull_number}',
+        {
+          owner,
+          repo: repoName,
+          pull_number: prNumber,
+        }
+      );
+      currentBody = currentPR.body || '';
+    } catch (error) {
+      // Se o PR não existe ou há erro de autenticação (em modo dry-run), simula PR vazio
+      if (
+        process.env.DRY_RUN === 'true' ||
+        error.status === 404 ||
+        error.status === 401
+      ) {
+        console.log(
+          '⚠️  Não foi possível buscar PR (esperado em modo dry-run). Simulando PR sem descrição.'
+        );
+        currentBody = '';
+      } else {
+        throw error;
       }
-    );
+    }
 
-    const currentBody = currentPR.body || '';
+    // Em modo dry-run, força PR sem descrição para teste
+    if (process.env.DRY_RUN === 'true') {
+      currentBody = '';
+      console.log('🧪 Modo dry-run: Forçando PR sem descrição para teste.');
+    }
 
     // Verifica se o PR já possui uma descrição
     if (hasExistingDescription(currentBody, config)) {
@@ -787,6 +847,17 @@ async function main() {
       ]
         .filter(Boolean)
         .join('\n\n');
+    }
+
+    // Se DRY_RUN estiver configurado, apenas exibe o body sem atualizar
+    if (process.env.DRY_RUN === 'true') {
+      console.log('\n' + '═'.repeat(60));
+      console.log('📄 BODY GERADO (DRY RUN - não foi atualizado no PR):');
+      console.log('═'.repeat(60));
+      console.log(finalBody);
+      console.log('═'.repeat(60));
+      console.log('\n✅ Body gerado com sucesso (modo dry-run)');
+      return;
     }
 
     // Atualiza o PR
