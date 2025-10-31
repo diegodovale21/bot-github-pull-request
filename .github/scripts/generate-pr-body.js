@@ -22,13 +22,27 @@ const BOT_END_MARKER = '<!-- BOT_END -->';
  * Carrega configuração do bot
  */
 function loadBotConfig() {
-  const configPath = path.resolve(
-    process.cwd(),
-    '..',
-    '..',
-    '.github',
-    '.bot.yml'
-  );
+  // Determina o caminho base do repositório
+  // No GitHub Actions, process.cwd() já está na raiz do repositório
+  let configPath;
+
+  // Primeiro tenta encontrar relativo ao diretório atual (raiz do repo no GitHub Actions)
+  const rootPath = path.resolve(process.cwd());
+  const configAtRoot = path.join(rootPath, '.github', '.bot.yml');
+
+  // Se não encontrar, tenta relativo ao script (para desenvolvimento local)
+  if (fs.existsSync(configAtRoot)) {
+    configPath = configAtRoot;
+  } else {
+    // Se o script está em .github/scripts, sobe dois níveis até a raiz
+    const scriptDir = __dirname;
+    configPath = path.resolve(scriptDir, '..', '..', '.github', '.bot.yml');
+  }
+
+  if (!fs.existsSync(configPath)) {
+    throw new Error(`Arquivo de configuração não encontrado: ${configPath}`);
+  }
+
   const content = fs.readFileSync(configPath, 'utf8');
   return yaml.load(content);
 }
