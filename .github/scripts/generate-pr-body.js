@@ -14,6 +14,7 @@ const fs = require('fs');
 const path = require('path');
 const yaml = require('js-yaml');
 const { Octokit } = require('@octokit/core');
+const OpenAI = require('openai');
 
 const BOT_START_MARKER = '<!-- BOT_START -->';
 const BOT_END_MARKER = '<!-- BOT_END -->';
@@ -264,6 +265,259 @@ function extractPreservedContent(currentBody, useDelimiters) {
 }
 
 /**
+ * Prepara o contexto das mudanças para o LLM
+ */
+async function prepareChangesContext(octokit, owner, repo, prNumber, config) {
+  try {
+    const { data: files } = await octokit.request(
+      'GET /repos/{owner}/{repo}/pulls/{pull_number}/files',
+      {
+        owner,
+        repo,
+        pull_number: prNumber,
+      }
+    );
+
+    if (!files || files.length === 0) {
+      return 'Nenhum arquivo modificado.';
+    }
+
+    let context = 'Mudanças no Pull Request:\n\n';
+
+    for (const file of files) {
+      if (shouldIgnoreFile(file.filename, config)) {
+        continue;
+      }
+
+      const status = file.status;
+      const statusEmoji =
+        status === 'added'
+          ? '➕'
+          : status === 'removed'
+          ? '➖'
+          : status === 'renamed'
+          ? '🔄'
+          : '✏️';
+
+      context += `${statusEmoji} ${file.filename} (${status})\n`;
+
+      if (file.additions)
+        context += `  +${file.additions} linhas adicionadas\n`;
+      if (file.deletions) context += `  -${file.deletions} linhas removidas\n`;
+
+      // Adiciona um resumo do patch (limitado para não exceder tokens)
+      if (file.patch) {
+        const patchLines = file.patch.split('\n').slice(0, 30); // Limita a 30 linhas
+        context += `\n  Diferenças:\n${patchLines.join('\n')}\n`;
+      }
+
+      context += '\n';
+    }
+
+    return context;
+  } catch (error) {
+    console.error('Erro ao preparar contexto:', error.message);
+    return 'Erro ao analisar mudanças.';
+  }
+}
+
+/**
+ * Gera descrição inteligente usando LLM
+ */
+async function generateLLMDescription(changesContext, prTitle, config) {
+  const rules = config.rules || {};
+  const llmConfig = rules.llm || {};
+
+  if (!rules.use_llm || llmConfig.provider !== 'openai') {
+    return null;
+  }
+
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) {
+    console.warn('⚠️ OPENAI_API_KEY não configurada. Pulando geração com LLM.');
+    return null;
+  }
+
+  try {
+    const openai = new OpenAI({ apiKey });
+    const sections = (config.templates && config.templates.sections) || [];
+
+    // Prepara prompt com as seções do template
+    const sectionInstructions = sections
+      .map((s) => {
+        const sectionName = s.title.toLowerCase();
+        if (
+          sectionName.includes('problema') ||
+          sectionName.includes('contexto')
+        ) {
+          return `- **${s.title}**: Analise as mudanças e identifique qual problema ou contexto motivou essas alterações.`;
+        } else if (
+          sectionName.includes('solução') ||
+          sectionName.includes('proposta')
+        ) {
+          return `- **${s.title}**: Descreva a solução implementada, principais mudanças técnicas e decisões arquiteturais.`;
+        } else if (
+          sectionName.includes('testar') ||
+          sectionName.includes('teste')
+        ) {
+          return `- **${s.title}**: Sugira passos para testar e validar as mudanças.`;
+        }
+        return `- **${s.title}**: ${s.placeholder || ''}`;
+      })
+      .join('\n');
+
+    const sectionTitles = sections.map((s) => s.title).join(', ');
+
+    const prompt = `Você é um assistente especializado em analisar Pull Requests. Analise as seguintes mudanças e gere uma descrição estruturada do PR.
+
+**Mudanças:**
+${changesContext}
+
+**Instruções:**
+Gere uma descrição profissional em português brasileiro, preenchendo as seguintes seções nesta ordem exata:
+${sectionInstructions}
+
+**Formato de resposta obrigatório:**
+Para cada seção, use exatamente este formato:
+**Nome da Seção:**
+Conteúdo da seção aqui...
+
+Exemplo:
+**Qual o problema / Contexto:**
+Este PR resolve o problema de...
+
+**Solução proposta:**
+A solução implementa...
+
+IMPORTANTE: Use o formato **Título da Seção:** seguido de quebra de linha e o conteúdo. Use exatamente os títulos: ${sectionTitles}
+
+**Requisitos:**
+- Seja específico e técnico
+- Mencione arquivos e funcionalidades alteradas quando relevante
+- Use linguagem clara e objetiva
+- Respeite o formato exato acima
+- Preencha TODAS as seções solicitadas`;
+
+    const response = await openai.chat.completions.create({
+      model: llmConfig.model || 'gpt-4o-mini',
+      messages: [
+        {
+          role: 'system',
+          content:
+            'Você é um assistente especializado em documentar Pull Requests de forma técnica e profissional.',
+        },
+        {
+          role: 'user',
+          content: prompt,
+        },
+      ],
+      temperature: llmConfig.temperature || 0.7,
+      max_tokens: llmConfig.max_tokens || 1000,
+    });
+
+    const generatedContent = response.choices[0]?.message?.content || '';
+    return generatedContent.trim();
+  } catch (error) {
+    console.error('Erro ao gerar descrição com LLM:', error.message);
+    return null;
+  }
+}
+
+/**
+ * Parseia a resposta do LLM e preenche as seções
+ */
+function parseLLMResponse(llmResponse, sections) {
+  const parsed = {};
+  const lines = llmResponse.split('\n');
+  let currentSection = null;
+  let currentContent = [];
+
+  // Mapeia títulos das seções para identificação
+  const sectionMap = {};
+  for (const s of sections) {
+    const key = s.title.toLowerCase();
+    sectionMap[key] = s.title;
+    // Também adiciona variações comuns
+    if (key.includes('problema')) sectionMap['problema'] = s.title;
+    if (key.includes('contexto')) sectionMap['contexto'] = s.title;
+    if (key.includes('solução')) sectionMap['solução'] = s.title;
+    if (key.includes('proposta')) sectionMap['proposta'] = s.title;
+    if (key.includes('testar')) sectionMap['testar'] = s.title;
+    if (key.includes('teste')) sectionMap['teste'] = s.title;
+  }
+
+  for (const line of lines) {
+    // Detecta início de seção em vários formatos
+    let sectionTitle = null;
+
+    // Formato: ## Título
+    let match = line.match(/^##\s*(.+)$/);
+    if (match) {
+      sectionTitle = match[1].trim().toLowerCase();
+    }
+
+    // Formato: **Título** ou *Título*
+    if (!sectionTitle) {
+      match = line.match(/^\*\*?\s*(.+?)\s*\*?\*?$/);
+      if (match && line.includes('**')) {
+        sectionTitle = match[1].trim().toLowerCase();
+      }
+    }
+
+    // Formato: Título: (sem markdown)
+    if (!sectionTitle) {
+      match = line.match(/^(.+?):\s*$/);
+      if (match && match[1].length < 50) {
+        sectionTitle = match[1].trim().toLowerCase();
+      }
+    }
+
+    if (sectionTitle) {
+      // Salva seção anterior
+      if (currentSection && currentContent.length > 0) {
+        parsed[currentSection] = currentContent.join('\n').trim();
+      }
+
+      // Mapeia para a seção correta
+      for (const key in sectionMap) {
+        if (sectionTitle.includes(key) || key.includes(sectionTitle)) {
+          currentSection = sectionMap[key].toLowerCase();
+          currentContent = [];
+          break;
+        }
+      }
+
+      // Se não encontrou mapeamento, tenta usar diretamente
+      if (!currentSection && sectionMap[sectionTitle]) {
+        currentSection = sectionMap[sectionTitle].toLowerCase();
+        currentContent = [];
+      }
+
+      continue;
+    }
+
+    // Adiciona conteúdo à seção atual
+    if (currentSection && line.trim()) {
+      currentContent.push(line);
+    } else if (!currentSection && line.trim() && !line.match(/^[-*]\s*$/)) {
+      // Se não há seção definida mas há conteúdo, pode ser que o LLM não formatou
+      // Tenta associar ao primeiro conteúdo encontrado
+      if (sections.length > 0 && !parsed[sections[0].title.toLowerCase()]) {
+        currentSection = sections[0].title.toLowerCase();
+        currentContent = [line];
+      }
+    }
+  }
+
+  // Adiciona último conteúdo
+  if (currentSection && currentContent.length > 0) {
+    parsed[currentSection] = currentContent.join('\n').trim();
+  }
+
+  return parsed;
+}
+
+/**
  * Constrói o body do PR
  */
 async function buildBody(config, event, octokit, owner, repo, prNumber) {
@@ -275,10 +529,59 @@ async function buildBody(config, event, octokit, owner, repo, prNumber) {
   const sections = (config.templates && config.templates.sections) || [];
   let body = `# ${title}\n\n`;
 
-  // Adiciona seções do template
-  for (const s of sections) {
-    body += `## ${s.title}\n\n`;
-    body += `${s.placeholder || ''}\n\n`;
+  // Tenta gerar descrição com LLM se habilitado
+  let llmContent = null;
+  const rules = config.rules || {};
+  if (rules.use_llm) {
+    try {
+      const changesContext = await prepareChangesContext(
+        octokit,
+        owner,
+        repo,
+        prNumber,
+        config
+      );
+      llmContent = await generateLLMDescription(changesContext, title, config);
+
+      if (llmContent) {
+        const parsedSections = parseLLMResponse(llmContent, sections);
+
+        // Preenche seções com conteúdo do LLM ou placeholder
+        for (const s of sections) {
+          body += `## ${s.title}\n\n`;
+          const sectionKey = s.title.toLowerCase();
+          const llmText = parsedSections[sectionKey];
+
+          if (llmText) {
+            body += `${llmText}\n\n`;
+          } else {
+            // Fallback: busca no conteúdo completo
+            const sectionLower = s.title.toLowerCase();
+            let found = false;
+            for (const key in parsedSections) {
+              if (sectionLower.includes(key) || key.includes(sectionLower)) {
+                body += `${parsedSections[key]}\n\n`;
+                found = true;
+                break;
+              }
+            }
+            if (!found) {
+              body += `${s.placeholder || ''}\n\n`;
+            }
+          }
+        }
+      }
+    } catch (error) {
+      console.error('Erro ao usar LLM, usando template padrão:', error.message);
+    }
+  }
+
+  // Se LLM não foi usado ou falhou, usa template padrão
+  if (!llmContent) {
+    for (const s of sections) {
+      body += `## ${s.title}\n\n`;
+      body += `${s.placeholder || ''}\n\n`;
+    }
   }
 
   // Adiciona changelist se configurado
@@ -299,6 +602,74 @@ async function buildBody(config, event, octokit, owner, repo, prNumber) {
   }
 
   return body.trim();
+}
+
+/**
+ * Verifica se o PR já possui uma descrição válida (não vazia e não só placeholders)
+ */
+function hasExistingDescription(currentBody, config) {
+  if (!currentBody || typeof currentBody !== 'string') {
+    return false;
+  }
+
+  const normalizedBody = currentBody.trim();
+
+  // Se estiver vazio, não tem descrição
+  if (normalizedBody.length === 0) {
+    return false;
+  }
+
+  // Remove delimitadores do bot para análise
+  let bodyToCheck = normalizedBody;
+  const rules = config.rules || {};
+  if (rules.use_delimiters) {
+    const preserved = extractPreservedContent(normalizedBody, true);
+    // Se há conteúdo fora dos delimitadores, considera que já tem descrição do usuário
+    if (preserved.before.trim() || preserved.after.trim()) {
+      return true;
+    }
+    bodyToCheck = preserved.botContent.trim();
+
+    // Se dentro dos delimitadores está vazio, não tem descrição
+    if (bodyToCheck.length === 0) {
+      return false;
+    }
+  }
+
+  // Verifica se contém apenas placeholders padrão
+  const sections = (config.templates && config.templates.sections) || [];
+  const placeholders = sections
+    .map((s) => s.placeholder)
+    .filter(Boolean)
+    .map((p) => p.trim().toLowerCase());
+
+  // Se não há placeholders configurados, verifica apenas comprimento
+  if (placeholders.length === 0) {
+    return bodyToCheck.length > 50; // Mínimo de 50 caracteres
+  }
+
+  const bodyLower = bodyToCheck.toLowerCase();
+
+  // Verifica se TODOS os placeholders estão presentes (indica que é só template)
+  let allPlaceholdersPresent = true;
+  for (const placeholder of placeholders) {
+    if (placeholder && !bodyLower.includes(placeholder)) {
+      allPlaceholdersPresent = false;
+      break;
+    }
+  }
+
+  // Se todos os placeholders estão presentes E o body é pequeno, provavelmente é só template
+  if (allPlaceholdersPresent && bodyToCheck.length < 200) {
+    return false;
+  }
+
+  // Se tem conteúdo significativo (mais que 100 caracteres) e não são só placeholders
+  // OU se algum placeholder não está presente (usuário preencheu), tem descrição
+  const hasSignificantContent = bodyToCheck.length > 100;
+  const hasCustomContent = !allPlaceholdersPresent;
+
+  return hasSignificantContent || hasCustomContent;
 }
 
 /**
@@ -378,6 +749,14 @@ async function main() {
 
     const currentBody = currentPR.body || '';
 
+    // Verifica se o PR já possui uma descrição
+    if (hasExistingDescription(currentBody, config)) {
+      console.log('ℹ️  PR já possui descrição. Bot não irá alterar.');
+      return;
+    }
+
+    console.log('📝 PR não possui descrição. Gerando automaticamente...');
+
     // Constrói o novo body
     const newBody = await buildBody(
       config,
@@ -388,9 +767,9 @@ async function main() {
       prNumber
     );
 
-    // Verifica se deve atualizar
+    // Verifica se deve atualizar (evita loop)
     if (!shouldUpdatePR(event, config, currentBody, newBody)) {
-      console.log('PR não será atualizado (sem mudanças ou loop evitado)');
+      console.log('PR não será atualizado (loop evitado)');
       return;
     }
 
